@@ -156,6 +156,6 @@ async def handle_message(message: Message):
 async def main():
     app = web.Application()
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
-    await bot.set_webhook("https://YOUR_DOMAIN.onrender.com/webhook")
+   await bot.set_webhook("https://telegram-bot-0269.onrender.com/webhook")
     setup_application(app, dp, bot=bot)
     return app
