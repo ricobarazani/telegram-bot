@@ -1,40 +1,30 @@
 import os
 import json
-import asyncio
-import logging
-import socket
+import re
 import threading
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember, ChatMemberUpdated
+import socket
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, filters,
-    ContextTypes, CallbackQueryHandler, ChatMemberHandler
+    ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler,
+    filters, CallbackQueryHandler, ChatMemberHandler
 )
-from dotenv import load_dotenv
 
-load_dotenv()
-
+# ========= הגדרות בסיס =========
 TOKEN = os.getenv("BOT_TOKEN")
 DATA_FILE = "data.json"
 
-# ---------------------- Fake Port Binding ----------------------
+# ========= התחזות לפתיחת פורט =========
 def fake_port():
     s = socket.socket()
     s.bind(("0.0.0.0", 10000))
     s.listen(1)
     while True:
-        time.sleep(10)
+        threading.Event().wait(10)
 
 threading.Thread(target=fake_port, daemon=True).start()
 
-# ---------------------- Logging ----------------------
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ---------------------- Data Handling ----------------------
+# ========= ניהול קובץ נתונים =========
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {}
@@ -43,163 +33,195 @@ def load_data():
 
 def save_data(data):
     with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=4)
+        json.dump(data, f, indent=2)
 
-data = load_data()
+# ========= סינון קישורים =========
+def extract_links(text):
+    regex = r"(https?://\S+|t\.me/\S+|@\w+)"
+    return re.findall(regex, text)
 
-# ---------------------- Helper Functions ----------------------
-def get_chat_config(chat_id):
-    return data.setdefault(str(chat_id), {
-        "allowed_users": [],
-        "link_types": {
-            "telegram": True,
-            "web": True,
-            "usernames": True
-        },
-        "ad_manager_id": None
-    })
+# ========= הגדרות ברירת מחדל =========
+def ensure_group_config(data, chat_id):
+    if str(chat_id) not in data:
+        data[str(chat_id)] = {
+            "owner": None,
+            "authorized": [],
+            "filters_config": {
+                "web_links": True,
+                "telegram_links": True,
+                "usernames": True,
+                "forwards": True
+            },
+            "ad_manager": None
+        }
+        save_data(data)
 
-def is_user_admin(chat_member: ChatMember):
-    return chat_member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+# ========= ניהול הרשאות =========
+def is_owner(chat_id, user_id):
+    data = load_data()
+    ensure_group_config(data, chat_id)
+    return data[str(chat_id)]["owner"] == user_id
 
-async def is_admin(user_id, chat_id, context):
-    member = await context.bot.get_chat_member(chat_id, user_id)
-    return is_user_admin(member)
+def is_authorized(chat_id, user_id):
+    data = load_data()
+    ensure_group_config(data, chat_id)
+    return user_id in data[str(chat_id)]["authorized"]
 
-# ---------------------- Command Handlers ----------------------
+# ========= Command Handlers =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 שלום!\n\n"
         "אני בוט ניהול פרסומים לקבוצות טלגרם.\n\n"
-        "✅ הודעות לא מאושרות לא יכילו קישורים ויימחקו.\n"
-        "✅ ניתן להגדיר מנהל להסדרת פרסומים.\n\n"
-        "השתמש בפקודת /help כדי לראות את רשימת הפקודות."
+        "✅ הודעות לא מאושרות לא יכילו קישורים ויימחקו אוטומטית.\n"
+        "✅ ניתן לאשר משתמשים או לקבוע סינון מותאם אישית.\n\n"
+        "השתמש בפקודת /help לצפייה ברשימת הפקודות."
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📚 פקודות זמינות:\n"
-        "/set_ad_manager <@username> - הגדרת מנהל פרסומים.\n"
-        "/approve <@username> - אישור משתמש לפרסום.\n"
-        "/approved - הצגת רשימת מאושרים.\n"
-        "/settings - קביעת סוגי קישורים למחיקה."
+        "/setowner - קביעת בעלים (רק בטווח פרטי)\n"
+        "/setmanager - קביעת מנהל לפניות\n"
+        "/approve - אישור משתמש\n"
+        "/list - רשימת מאושרים\n"
+        "/settings - קביעת סינון\n"
     )
 
-async def set_ad_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id, update.effective_chat.id, context):
+async def setowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat.type != "private":
         return
+    data = load_data()
+    chat_id = context.args[0] if context.args else None
+    if chat_id:
+        data.setdefault(str(chat_id), {})
+        data[str(chat_id)]["owner"] = update.message.from_user.id
+        save_data(data)
+        await update.message.reply_text("הוגדרת כבעלים של הקבוצה.")
 
+async def setmanager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if not is_owner(chat_id, user_id):
+        return
     if not context.args:
-        await update.message.reply_text("🛠 נא לציין שם משתמש.")
+        await update.message.reply_text("אנא תייג את המנהל / שלח את מזהה המשתמש.")
         return
-
-    username = context.args[0].lstrip("@")
-    config = get_chat_config(update.effective_chat.id)
-    config['ad_manager_id'] = username
+    target = int(context.args[0].lstrip("@"))
+    data = load_data()
+    data[str(chat_id)]["ad_manager"] = target
     save_data(data)
-    await update.message.reply_text(f"👤 {username} הוגדר כמנהל להסדרת פרסומים.")
+    await update.message.reply_text("המנהל הוגדר בהצלחה.")
 
 async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id, update.effective_chat.id, context):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if not is_owner(chat_id, user_id):
         return
-
     if not context.args:
-        await update.message.reply_text("❗ נא לציין שם משתמש לאישור.")
+        await update.message.reply_text("יש לציין מזהה משתמש או לתייג.")
         return
+    target = int(context.args[0].lstrip("@"))
+    data = load_data()
+    data[str(chat_id)]["authorized"].append(target)
+    save_data(data)
+    await update.message.reply_text("המשתמש אושר.")
 
-    username = context.args[0].lstrip("@")
-    config = get_chat_config(update.effective_chat.id)
-    if username not in config['allowed_users']:
-        config['allowed_users'].append(username)
-        save_data(data)
-        await update.message.reply_text(f"✅ {username} אושר לפרסם קישורים.")
-    else:
-        await update.message.reply_text(f"ℹ️ {username} כבר מאושר.")
-
-async def approved_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    config = get_chat_config(update.effective_chat.id)
-    users = config['allowed_users']
-    if not users:
-        await update.message.reply_text("📭 אין משתמשים מאושרים.")
-    else:
-        await update.message.reply_text("📋 משתמשים מאושרים:\n" + "\n".join(f"@{u}" for u in users))
+async def list_approved(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    data = load_data()
+    approved = data.get(str(chat_id), {}).get("authorized", [])
+    if not approved:
+        await update.message.reply_text("אין משתמשים מאושרים.")
+        return
+    await update.message.reply_text("מאושרים:\n" + '\n'.join(map(str, approved)))
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id, update.effective_chat.id, context):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if not is_owner(chat_id, user_id):
         return
-
-    config = get_chat_config(update.effective_chat.id)
-    buttons = [
-        [InlineKeyboardButton(f"📎 טלגרם: {'✅' if config['link_types']['telegram'] else '❌'}", callback_data='toggle_telegram')],
-        [InlineKeyboardButton(f"🌐 אתרים: {'✅' if config['link_types']['web'] else '❌'}", callback_data='toggle_web')],
-        [InlineKeyboardButton(f"👤 יוזרים: {'✅' if config['link_types']['usernames'] else '❌'}", callback_data='toggle_usernames')]
+    data = load_data()
+    config = data[str(chat_id)]["filters_config"]
+    keyboard = [
+        [InlineKeyboardButton(f"קישורים חיצוניים {'✅' if config['web_links'] else '❌'}", callback_data='toggle_web')],
+        [InlineKeyboardButton(f"לינקים טלגרם {'✅' if config['telegram_links'] else '❌'}", callback_data='toggle_telegram')],
+        [InlineKeyboardButton(f"שמות משתמשים @ {'✅' if config['usernames'] else '❌'}", callback_data='toggle_usernames')],
+        [InlineKeyboardButton(f"הודעות מועברות {'✅' if config['forwards'] else '❌'}", callback_data='toggle_forwards')]
     ]
-    await update.message.reply_text("⚙️ הגדר אילו קישורים למחוק:", reply_markup=InlineKeyboardMarkup(buttons))
+    await update.message.reply_text("בחר מה למחוק אוטומטית:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    config = get_chat_config(query.message.chat.id)
-    if query.data.startswith("toggle_"):
-        key = query.data.replace("toggle_", "")
-        config['link_types'][key] = not config['link_types'][key]
+    chat_id = query.message.chat.id
+    user_id = query.from_user.id
+    if not is_owner(chat_id, user_id):
+        return
+    data = load_data()
+    key_map = {
+        'toggle_web': 'web_links',
+        'toggle_telegram': 'telegram_links',
+        'toggle_usernames': 'usernames',
+        'toggle_forwards': 'forwards'
+    }
+    key = key_map.get(query.data)
+    if key:
+        data[str(chat_id)]["filters_config"][key] ^= True
         save_data(data)
         await settings(update, context)
 
-# ---------------------- Message Filtering ----------------------
-def contains_link(text, config):
-    import re
-    if config['link_types'].get("telegram"):
-        if re.search(r"t\.me/|telegram\.me/", text):
-            return True
-    if config['link_types'].get("web"):
-        if re.search(r"https?://", text):
-            return True
-    if config['link_types'].get("usernames"):
-        if re.search(r"@\w+", text):
-            return True
-    return False
-
+# ========= סינון הודעות =========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    chat_id = str(message.chat.id)
-    user = message.from_user
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    data = load_data()
+    ensure_group_config(data, chat_id)
 
-    config = get_chat_config(chat_id)
-
-    if await is_admin(user.id, chat_id, context):
+    if is_authorized(chat_id, user_id):
         return
 
-    if contains_link(message.text or "", config):
-        if user.username not in config['allowed_users']:
-            await message.delete()
-            if config['ad_manager_id']:
-                button = InlineKeyboardMarkup.from_button(
-                    InlineKeyboardButton("📩 להסדרת פרסום", url=f"https://t.me/{config['ad_manager_id']}")
-                )
-                await message.chat.send_message(
-                    f"@{user.username} הפרסום נמחק. להסדרת פרסום פנה למנהל.",
-                    reply_markup=button
-                )
+    text = message.text or message.caption or ""
+    links = extract_links(text)
+    should_delete = False
 
-# ---------------------- Main ----------------------
+    filters_config = data[str(chat_id)]["filters_config"]
+    for link in links:
+        if filters_config["web_links"] and link.startswith("http"):
+            should_delete = True
+        elif filters_config["telegram_links"] and "t.me/" in link:
+            should_delete = True
+        elif filters_config["usernames"] and link.startswith("@"):
+            should_delete = True
+
+    if message.forward_from_chat and filters_config["forwards"]:
+        should_delete = True
+
+    if should_delete:
+        await message.delete()
+        manager_id = data[str(chat_id)].get("ad_manager")
+        if manager_id:
+            keyboard = [[InlineKeyboardButton("פנייה למנהל", url=f"https://t.me/{manager_id}")]]
+            await message.chat.send_message(
+                "כדי לפרסם בקבוצה – יש להסדיר זאת עם מנהל הפרסומים.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+# ========= Bot Startup =========
 async def main():
-    application = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("set_ad_manager", set_ad_manager))
-    application.add_handler(CommandHandler("approve", approve))
-    application.add_handler(CommandHandler("approved", approved_list))
-    application.add_handler(CommandHandler("settings", settings))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("setowner", setowner))
+    app.add_handler(CommandHandler("setmanager", setmanager))
+    app.add_handler(CommandHandler("approve", approve))
+    app.add_handler(CommandHandler("list", list_approved))
+    app.add_handler(CommandHandler("settings", settings))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT | filters.FORWARDED, handle_message))
 
-    await application.initialize()
-    await application.start()
-    await asyncio.Event().wait()
+    await app.run_polling()
 
 if __name__ == '__main__':
-    import time
+    import asyncio
     asyncio.run(main())
