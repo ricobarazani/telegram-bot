@@ -4,11 +4,17 @@ import logging
 import asyncio
 import socket
 import threading
-from telegram import Update, ChatMember, Chat, MessageEntity
-from telegram.ext import (Application, CommandHandler, MessageHandler,
-                          filters, ContextTypes, ChatMemberHandler)
+from telegram import Update, ChatMember, ChatMemberUpdated, MessageEntity
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ChatMemberHandler
+)
 
-# התחבולה לפתיחת פורט לרנדר
+# התחבולה לפתיחת פורט ברנדר
 
 def fake_port():
     s = socket.socket()
@@ -34,110 +40,120 @@ def save_data(data):
 
 data = load_data()
 
-# יצירת קבוצות עם ברירת מחדל
-if "groups" not in data:
-    data["groups"] = {}
-    save_data(data)
+# יצירת רשימת קישורים לקבוצות
+GROUP_LINKS = [
+    "t.me/",
+    "https://t.me/",
+    "joinchat/",
+    "telegram.me/",
+    "https://telegram.me/"
+]
 
-# ===== Command Handlers =====
+# ========== Command Handlers ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         """
-👋 שלום! אני בוט ניהול קבוצות טלגרם.
-✅ מזהה ומוחק קישורים והעברות לפי הגדרות הקבוצה.
-✅ ניתן להגדיר מנהלי פרסום עם סינון ספציפי.
+👋 שלום!
+אני בוט ניהול פרסומים לקבוצת טלגרם ✅.
+✅ מזהה ומוחק קישורים והודעות לא מאושרות לפי הגדרות המנהל.
+✅ ניתן להגדיר מנהל ולהתאים סינון ספציפי.
 
-כדי לראות את הפקודות המלאות השתמש בפקודה /help
+כדי לראות את הפקודות המלאות /help השתמש בפקודה
         """
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         """
-📋 רשימת פקודות:
-/start – התחלה והצגת מידע
-/help – הצגת עזרה
-/allow <username> – לאפשר למשתמש לפרסם (קבוצה בלבד)
-/disallow <username> – לבטל אפשרות פרסום
-/status – הצגת משתמשים מורשים
+📌 פקודות ניהול זמינות:
+
+/allow [user_id] - הוספת משתמש מורשה
+/disallow [user_id] - הסרת משתמש מורשה
+/list_allowed - הצגת משתמשים מורשים
+
+/setadmin [user_id] - הגדרת מנהל
+/myid - הצגת מזהה המשתמש שלך
         """
     )
 
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"המזהה שלך הוא: {update.effective_user.id}")
+
+# ========== Filter & Message Logic ==========
+
+def extract_user_id(text: str) -> str:
+    return text.split()[1] if len(text.split()) > 1 else None
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user_id = str(message.from_user.id)
+    text = message.text or ""
+
+    if any(link in text for link in GROUP_LINKS):
+        if user_id not in data.get("allowed_users", []):
+            await message.delete()
+            return
+
 async def allow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != Chat.GROUP and update.effective_chat.type != Chat.SUPERGROUP:
-        return await update.message.reply_text("פקודה זו זמינה רק בקבוצות.")
-
-    if not context.args:
-        return await update.message.reply_text("אנא ציין שם משתמש. לדוגמה: /allow username")
-
-    username = context.args[0].lstrip("@")
-    group_id = str(update.effective_chat.id)
-
-    data.setdefault("groups", {}).setdefault(group_id, {}).setdefault("usernames", []).append(username)
+    user_id = extract_user_id(update.message.text)
+    if not user_id:
+        await update.message.reply_text("יש לציין מזהה משתמש.")
+        return
+    data.setdefault("allowed_users", []).append(user_id)
     save_data(data)
-    await update.message.reply_text(f"המשתמש @{username} נוסף לרשימת המורשים לפרסם.")
+    await update.message.reply_text(f"משתמש {user_id} אושר.")
 
 async def disallow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != Chat.GROUP and update.effective_chat.type != Chat.SUPERGROUP:
-        return await update.message.reply_text("פקודה זו זמינה רק בקבוצות.")
-
-    if not context.args:
-        return await update.message.reply_text("אנא ציין שם משתמש. לדוגמה: /disallow username")
-
-    username = context.args[0].lstrip("@")
-    group_id = str(update.effective_chat.id)
-    group_data = data.get("groups", {}).get(group_id, {})
-    if "usernames" in group_data and username in group_data["usernames"]:
-        group_data["usernames"].remove(username)
-        save_data(data)
-        await update.message.reply_text(f"המשתמש @{username} הוסר מרשימת המורשים לפרסם.")
-    else:
-        await update.message.reply_text(f"@{username} לא נמצא ברשימת המורשים.")
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    group_id = str(update.effective_chat.id)
-    allowed = data.get("groups", {}).get(group_id, {}).get("usernames", [])
-    if not allowed:
-        await update.message.reply_text("לא הוגדרו משתמשים מורשים עדיין.")
-    else:
-        await update.message.reply_text("משתמשים מורשים:\n" + "\n".join(f"@{u}" for u in allowed))
-
-# ===== מסנן הודעות =====
-async def filter_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    user = update.effective_user
-    group_id = str(update.effective_chat.id)
-
-    # קישורים והעברות
-    has_link = any(entity.type in [MessageEntity.URL, MessageEntity.TEXT_LINK] for entity in message.entities or [])
-    is_forward = message.forward_date is not None
-
-    allowed_users = data.get("groups", {}).get(group_id, {}).get("usernames", [])
-    if user.username in allowed_users:
+    user_id = extract_user_id(update.message.text)
+    if not user_id:
+        await update.message.reply_text("יש לציין מזהה משתמש.")
         return
+    if user_id in data.get("allowed_users", []):
+        data["allowed_users"].remove(user_id)
+        save_data(data)
+        await update.message.reply_text(f"משתמש {user_id} הוסר.")
+    else:
+        await update.message.reply_text(f"המשתמש {user_id} לא נמצא ברשימה.")
 
-    if has_link or is_forward:
-        try:
-            await message.delete()
-        except Exception:
-            pass
+async def list_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    allowed = data.get("allowed_users", [])
+    if not allowed:
+        await update.message.reply_text("אין משתמשים מאושרים.")
+    else:
+        await update.message.reply_text("משתמשים מאושרים:\n" + "\n".join(allowed))
 
-# ===== Main =====
+async def set_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = extract_user_id(update.message.text)
+    if not user_id:
+        await update.message.reply_text("יש לציין מזהה משתמש.")
+        return
+    data["admin"] = user_id
+    save_data(data)
+    await update.message.reply_text(f"משתמש {user_id} הוגדר כמנהל.")
 
+# ========== Bot Setup ==========
+
+token = os.getenv("BOT_TOKEN")
+app = ApplicationBuilder().token(token).build()
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("help", help_command))
+app.add_handler(CommandHandler("myid", myid))
+app.add_handler(CommandHandler("allow", allow))
+app.add_handler(CommandHandler("disallow", disallow))
+app.add_handler(CommandHandler("list_allowed", list_allowed))
+app.add_handler(CommandHandler("setadmin", set_admin))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+# פתרון לבעיית הלולאה ברנדר
 async def main():
-    token = os.getenv("BOT_TOKEN")
-    app = Application.builder().token(token).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("allow", allow))
-    app.add_handler(CommandHandler("disallow", disallow))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, filter_messages))
-
-    print("Bot is running...")
-    await app.run_polling()
+    await app.initialize()
+    await app.start()
+    await asyncio.Event().wait()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot stopped.")
