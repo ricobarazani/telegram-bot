@@ -1,5 +1,0 @@
-aiogram==3.4.1
-fastapi==0.110.2
-aiohttp==3.9.5
-uvicorn==0.29.0
-python-dotenv==1.0.1
