@@ -4,10 +4,11 @@ import logging
 import asyncio
 import socket
 import threading
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram import Update, ChatMember, Chat, MessageEntity
+from telegram.ext import (Application, CommandHandler, MessageHandler,
+                          filters, ContextTypes, ChatMemberHandler)
 
-# התחזות לפתיחת פורט לרנדר
+# התחבולה לפתיחת פורט לרנדר
 
 def fake_port():
     s = socket.socket()
@@ -33,167 +34,109 @@ def save_data(data):
 
 data = load_data()
 
-# יצירת קונפיג לקבוצה
+# יצירת קבוצות עם ברירת מחדל
+if "groups" not in data:
+    data["groups"] = {}
+    save_data(data)
 
-def get_chat_config(chat_id):
-    return data.setdefault(str(chat_id), {
-        "approved_users": [],
-        "manager": None,
-        "filters": {
-            "links": True,
-            "usernames": True,
-            "forwards": True
-        },
-        "owner": None
-    })
+# ===== Command Handlers =====
 
-# פקודות
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         """
-👋 שלום!
-אני בוט ניהול פרסומים לקבוצות טלגרם ✅
+👋 שלום! אני בוט ניהול קבוצות טלגרם.
+✅ מזהה ומוחק קישורים והעברות לפי הגדרות הקבוצה.
+✅ ניתן להגדיר מנהלי פרסום עם סינון ספציפי.
 
-📌 אני מזהה וחוסם קישורים והודעות לא מאושרות לפי הגדרות הבעלים.
-📌 ניתן להגדיר מנהל להסדרת פרסומים, ולהתאים סינון ספציפי.
-
-ℹ️ כדי לראות את רשימת הפקודות המלאה /help
+כדי לראות את הפקודות המלאות השתמש בפקודה /help
         """
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("""
-🛠 רשימת פקודות:
-/start – פתיחה
-/help – עזרה
-/setowner – הגדרת בעלים (יש לעשות בפרטי)
-/setmanager – הגדרת מנהל אחראי להסדרת פרסום
-/approve – אישור משתמש מסוים לפרסום
-/list – רשימת המשתמשים המאושרים
-/settings – קביעת סוגי קישורים שיימחקו
-    """)
+    await update.message.reply_text(
+        """
+📋 רשימת פקודות:
+/start – התחלה והצגת מידע
+/help – הצגת עזרה
+/allow <username> – לאפשר למשתמש לפרסם (קבוצה בלבד)
+/disallow <username> – לבטל אפשרות פרסום
+/status – הצגת משתמשים מורשים
+        """
+    )
 
-async def setowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type != "private":
-        return
-    if not context.args:
-        await update.message.reply_text("נא לציין chat_id של הקבוצה.")
-        return
-    chat_id = context.args[0]
-    data.setdefault(str(chat_id), {})
-    data[str(chat_id)]["owner"] = update.effective_user.id
-    save_data(data)
-    await update.message.reply_text("הוגדרת כבעלים של הקבוצה.")
+async def allow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != Chat.GROUP and update.effective_chat.type != Chat.SUPERGROUP:
+        return await update.message.reply_text("פקודה זו זמינה רק בקבוצות.")
 
-async def set_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    user_id = update.effective_user.id
-    config = get_chat_config(chat_id)
-    if config.get("owner") != user_id:
-        return
     if not context.args:
-        await update.message.reply_text("יש לציין שם משתמש של המנהל (@username)")
-        return
-    config["manager"] = context.args[0].lstrip("@")
-    save_data(data)
-    await update.message.reply_text(f"@{config['manager']} הוגדר כמנהל פרסומים.")
+        return await update.message.reply_text("אנא ציין שם משתמש. לדוגמה: /allow username")
 
-async def approve_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    user_id = update.effective_user.id
-    config = get_chat_config(chat_id)
-    if config.get("owner") != user_id:
-        return
-    if not context.args:
-        await update.message.reply_text("יש לציין שם משתמש (ללא @)")
-        return
     username = context.args[0].lstrip("@")
-    if username not in config["approved_users"]:
-        config["approved_users"].append(username)
-        save_data(data)
-    await update.message.reply_text(f"@{username} נוסף לרשימת המאושרים.")
+    group_id = str(update.effective_chat.id)
 
-async def list_approved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    config = get_chat_config(str(update.effective_chat.id))
-    approved = config.get("approved_users", [])
-    if approved:
-        await update.message.reply_text("📋 מאושרים:\n" + "\n".join(f"@{u}" for u in approved))
-    else:
-        await update.message.reply_text("אין מאושרים.")
-
-async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    user_id = update.effective_user.id
-    config = get_chat_config(chat_id)
-    if config.get("owner") != user_id:
-        return
-    buttons = [
-        [InlineKeyboardButton(f"קישורים {'✅' if config['filters']['links'] else '❌'}", callback_data="toggle_links")],
-        [InlineKeyboardButton(f"שמות משתמשים {'✅' if config['filters']['usernames'] else '❌'}", callback_data="toggle_usernames")],
-        [InlineKeyboardButton(f"העברות {'✅' if config['filters']['forwards'] else '❌'}", callback_data="toggle_forwards")]
-    ]
-    await update.message.reply_text("בחר אילו תכנים למחוק:", reply_markup=InlineKeyboardMarkup(buttons))
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = str(query.message.chat.id)
-    config = get_chat_config(chat_id)
-    field = query.data.replace("toggle_", "")
-    config["filters"][field] = not config["filters"][field]
+    data.setdefault("groups", {}).setdefault(group_id, {}).setdefault("usernames", []).append(username)
     save_data(data)
-    await settings(update, context)
+    await update.message.reply_text(f"המשתמש @{username} נוסף לרשימת המורשים לפרסם.")
 
-# סינון הודעות
-async def filter_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message:
+async def disallow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != Chat.GROUP and update.effective_chat.type != Chat.SUPERGROUP:
+        return await update.message.reply_text("פקודה זו זמינה רק בקבוצות.")
+
+    if not context.args:
+        return await update.message.reply_text("אנא ציין שם משתמש. לדוגמה: /disallow username")
+
+    username = context.args[0].lstrip("@")
+    group_id = str(update.effective_chat.id)
+    group_data = data.get("groups", {}).get(group_id, {})
+    if "usernames" in group_data and username in group_data["usernames"]:
+        group_data["usernames"].remove(username)
+        save_data(data)
+        await update.message.reply_text(f"המשתמש @{username} הוסר מרשימת המורשים לפרסם.")
+    else:
+        await update.message.reply_text(f"@{username} לא נמצא ברשימת המורשים.")
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    group_id = str(update.effective_chat.id)
+    allowed = data.get("groups", {}).get(group_id, {}).get("usernames", [])
+    if not allowed:
+        await update.message.reply_text("לא הוגדרו משתמשים מורשים עדיין.")
+    else:
+        await update.message.reply_text("משתמשים מורשים:\n" + "\n".join(f"@{u}" for u in allowed))
+
+# ===== מסנן הודעות =====
+async def filter_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    group_id = str(update.effective_chat.id)
+
+    # קישורים והעברות
+    has_link = any(entity.type in [MessageEntity.URL, MessageEntity.TEXT_LINK] for entity in message.entities or [])
+    is_forward = message.forward_date is not None
+
+    allowed_users = data.get("groups", {}).get(group_id, {}).get("usernames", [])
+    if user.username in allowed_users:
         return
-    chat_id = str(message.chat.id)
-    config = get_chat_config(chat_id)
-    user = message.from_user
-    username = user.username or str(user.id)
 
-    if username in config["approved_users"]:
-        return
-
-    should_delete = False
-    text = message.text or message.caption or ""
-    entities = message.entities or message.caption_entities or []
-
-    if config["filters"].get("links"):
-        if any(e.type in ["url", "text_link"] for e in entities):
-            should_delete = True
-    if config["filters"].get("usernames") and "@" in text:
-        should_delete = True
-    if config["filters"].get("forwards") and message.forward_from:
-        should_delete = True
-
-    if should_delete:
+    if has_link or is_forward:
         try:
             await message.delete()
-        except:
+        except Exception:
             pass
-        manager = config.get("manager")
-        if manager:
-            btn = InlineKeyboardMarkup.from_button(InlineKeyboardButton("לפנייה למנהל", url=f"https://t.me/{manager}"))
-            await message.chat.send_message("🔒 כדי לפרסם בקבוצה יש להסדיר זאת עם מנהל.", reply_markup=btn)
 
-# הרצה
+# ===== Main =====
+
 async def main():
-    TOKEN = os.getenv("BOT_TOKEN")
-    app = ApplicationBuilder().token(TOKEN).build()
+    token = os.getenv("BOT_TOKEN")
+    app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("setowner", setowner))
-    app.add_handler(CommandHandler("setmanager", set_manager))
-    app.add_handler(CommandHandler("approve", approve_user))
-    app.add_handler(CommandHandler("list", list_approved))
-    app.add_handler(CommandHandler("settings", settings))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.ALL, filter_message))
+    app.add_handler(CommandHandler("allow", allow))
+    app.add_handler(CommandHandler("disallow", disallow))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, filter_messages))
 
+    print("Bot is running...")
     await app.run_polling()
 
 if __name__ == '__main__':
