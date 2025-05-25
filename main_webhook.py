@@ -174,4 +174,4 @@ SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
 setup_application(app, dp, bot=bot, on_startup=on_startup)
 
 if __name__ == "__main__":
-    web.run_app(app, port=8080)
+    web.run_app(app, port=10000)
