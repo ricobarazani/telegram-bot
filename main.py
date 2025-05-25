@@ -1,8 +1,23 @@
-import threading
-import time
+import os
+import json
+import asyncio
+import logging
 import socket
+import threading
 
-# --- Render port trick ---
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember, ChatMemberUpdated
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, filters,
+    ContextTypes, CallbackQueryHandler, ChatMemberHandler
+)
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("BOT_TOKEN")
+DATA_FILE = "data.json"
+
+# ---------------------- Fake Port Binding ----------------------
 def fake_port():
     s = socket.socket()
     s.bind(("0.0.0.0", 10000))
@@ -12,202 +27,179 @@ def fake_port():
 
 threading.Thread(target=fake_port, daemon=True).start()
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-import os
-import json
-from dotenv import load_dotenv
+# ---------------------- Logging ----------------------
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-load_dotenv()
+# ---------------------- Data Handling ----------------------
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {}
+    with open(DATA_FILE, 'r') as f:
+        return json.load(f)
 
-TOKEN = os.getenv("BOT_TOKEN")
-DATA_FILE = "data.json"
+def save_data(data):
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
 
-if not os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "w") as f:
-        json.dump({}, f)
+data = load_data()
 
-with open(DATA_FILE, "r") as f:
-    data = json.load(f)
+# ---------------------- Helper Functions ----------------------
+def get_chat_config(chat_id):
+    return data.setdefault(str(chat_id), {
+        "allowed_users": [],
+        "link_types": {
+            "telegram": True,
+            "web": True,
+            "usernames": True
+        },
+        "ad_manager_id": None
+    })
 
-def save_data():
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def is_user_admin(chat_member: ChatMember):
+    return chat_member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
 
-# ========== Command Handlers ==========
+async def is_admin(user_id, chat_id, context):
+    member = await context.bot.get_chat_member(chat_id, user_id)
+    return is_user_admin(member)
+
+# ---------------------- Command Handlers ----------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("📥 קיבלת פקודת /start")
     await update.message.reply_text(
-        """
-👋 שלום!
-אני בוט ניהול פרסומים לקבוצות טלגרם ✅
-
-📌 אני מזהה וחוסם קישורים והודעות לא מאושרות לפי הגדרות הבעלים.
-📌 ניתן להגדיר מנהל להסדרת פרסומים, ולהתאים סינון ספציפי.
-
-ℹ️ כדי לראות את רשימת הפקודות המלאה /help השתמש בפקודה
-        """
+        "👋 שלום!\n\n"
+        "אני בוט ניהול פרסומים לקבוצות טלגרם.\n\n"
+        "✅ הודעות לא מאושרות לא יכילו קישורים ויימחקו.\n"
+        "✅ ניתן להגדיר מנהל להסדרת פרסומים.\n\n"
+        "השתמש בפקודת /help כדי לראות את רשימת הפקודות."
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("📥 קיבלת פקודת /help")
-    await update.message.reply_text("""
-🛠 רשימת פקודות:
+    await update.message.reply_text(
+        "📚 פקודות זמינות:\n"
+        "/set_ad_manager <@username> - הגדרת מנהל פרסומים.\n"
+        "/approve <@username> - אישור משתמש לפרסום.\n"
+        "/approved - הצגת רשימת מאושרים.\n"
+        "/settings - קביעת סוגי קישורים למחיקה."
+    )
 
-/settings – הגדרת סוגי קישורים שיימחקו
-/setmanager – הגדרת מנהל אחראי להסדרת פרסום
-/approve – אישור משתמש מסוים לפרסום
-/approved – רשימת המשתמשים המאושרים
-
-(רק בעלים יכול להפעיל פקודות אלו)
-    """)
-
-# ========== Utility Functions ==========
-def get_chat_config(chat_id):
-    return data.setdefault(str(chat_id), {
-        "approved_users": [],
-        "manager": None,
-        "filters": {
-            "links": True,
-            "usernames": True,
-            "forwards": True
-        }
-    })
-
-# ========== Command Logic ==========
-async def set_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    chat_member = await context.bot.get_chat_member(chat_id, user_id)
-    if chat_member.status != "creator":
+async def set_ad_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id, update.effective_chat.id, context):
         return
 
     if not context.args:
-        await update.message.reply_text("יש לציין שם משתמש של המנהל")
+        await update.message.reply_text("🛠 נא לציין שם משתמש.")
         return
 
     username = context.args[0].lstrip("@")
-    config = get_chat_config(chat_id)
-    config["manager"] = username
-    save_data()
-    await update.message.reply_text(f"@{username} הוגדר כמנהל להסדרת פרסומים")
+    config = get_chat_config(update.effective_chat.id)
+    config['ad_manager_id'] = username
+    save_data(data)
+    await update.message.reply_text(f"👤 {username} הוגדר כמנהל להסדרת פרסומים.")
 
-async def approve_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    chat_member = await context.bot.get_chat_member(chat_id, user_id)
-    if chat_member.status != "creator":
+async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id, update.effective_chat.id, context):
         return
 
     if not context.args:
-        await update.message.reply_text("יש לתייג או לציין את המשתמש לאישור")
+        await update.message.reply_text("❗ נא לציין שם משתמש לאישור.")
         return
 
-    user = context.args[0].lstrip("@")
-    config = get_chat_config(chat_id)
-    if user not in config["approved_users"]:
-        config["approved_users"].append(user)
-    save_data()
-    await update.message.reply_text(f"@{user} נוסף לרשימת המאושרים")
-
-async def list_approved(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = context.args[0].lstrip("@")
     config = get_chat_config(update.effective_chat.id)
-    approved = config["approved_users"]
-    if approved:
-        await update.message.reply_text("מאושרים לפרסום:\n" + "\n".join(f"@{u}" for u in approved))
+    if username not in config['allowed_users']:
+        config['allowed_users'].append(username)
+        save_data(data)
+        await update.message.reply_text(f"✅ {username} אושר לפרסם קישורים.")
     else:
-        await update.message.reply_text("אין משתמשים מאושרים כרגע.")
+        await update.message.reply_text(f"ℹ️ {username} כבר מאושר.")
 
-# ========== Settings Menu ==========
+async def approved_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    config = get_chat_config(update.effective_chat.id)
+    users = config['allowed_users']
+    if not users:
+        await update.message.reply_text("📭 אין משתמשים מאושרים.")
+    else:
+        await update.message.reply_text("📋 משתמשים מאושרים:\n" + "\n".join(f"@{u}" for u in users))
+
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    chat_member = await context.bot.get_chat_member(chat_id, user_id)
-    if chat_member.status != "creator":
+    if not await is_admin(update.effective_user.id, update.effective_chat.id, context):
         return
 
-    config = get_chat_config(chat_id)
+    config = get_chat_config(update.effective_chat.id)
     buttons = [
-        [InlineKeyboardButton(f"קישורים {'✅' if config['filters']['links'] else '❌'}", callback_data="toggle_links")],
-        [InlineKeyboardButton(f"שמות משתמש {'✅' if config['filters']['usernames'] else '❌'}", callback_data="toggle_usernames")],
-        [InlineKeyboardButton(f"הודעות מועברות {'✅' if config['filters']['forwards'] else '❌'}", callback_data="toggle_forwards")]
+        [InlineKeyboardButton(f"📎 טלגרם: {'✅' if config['link_types']['telegram'] else '❌'}", callback_data='toggle_telegram')],
+        [InlineKeyboardButton(f"🌐 אתרים: {'✅' if config['link_types']['web'] else '❌'}", callback_data='toggle_web')],
+        [InlineKeyboardButton(f"👤 יוזרים: {'✅' if config['link_types']['usernames'] else '❌'}", callback_data='toggle_usernames')]
     ]
-    await update.message.reply_text("בחר אילו תכנים למחוק אוטומטית:", reply_markup=InlineKeyboardMarkup(buttons))
+    await update.message.reply_text("⚙️ הגדר אילו קישורים למחוק:", reply_markup=InlineKeyboardMarkup(buttons))
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat.id
-    config = get_chat_config(chat_id)
 
+    config = get_chat_config(query.message.chat.id)
     if query.data.startswith("toggle_"):
-        field = query.data.split("_")[1]
-        config["filters"][field] = not config["filters"][field]
-        save_data()
+        key = query.data.replace("toggle_", "")
+        config['link_types'][key] = not config['link_types'][key]
+        save_data(data)
         await settings(update, context)
 
-# ========== Message Filter ==========
+# ---------------------- Message Filtering ----------------------
+def contains_link(text, config):
+    import re
+    if config['link_types'].get("telegram"):
+        if re.search(r"t\.me/|telegram\.me/", text):
+            return True
+    if config['link_types'].get("web"):
+        if re.search(r"https?://", text):
+            return True
+    if config['link_types'].get("usernames"):
+        if re.search(r"@\w+", text):
+            return True
+    return False
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    if not message:
-        return
-
-    chat_id = message.chat.id
+    chat_id = str(message.chat.id)
     user = message.from_user
+
     config = get_chat_config(chat_id)
 
-    is_owner = (await context.bot.get_chat_member(chat_id, user.id)).status == "creator"
-    is_admin = (await context.bot.get_chat_member(chat_id, user.id)).status in ["administrator", "creator"]
-
-    if is_admin:
+    if await is_admin(user.id, chat_id, context):
         return
 
-    text = message.text or message.caption or ""
-    entities = message.entities or message.caption_entities or []
-    should_delete = False
+    if contains_link(message.text or "", config):
+        if user.username not in config['allowed_users']:
+            await message.delete()
+            if config['ad_manager_id']:
+                button = InlineKeyboardMarkup.from_button(
+                    InlineKeyboardButton("📩 להסדרת פרסום", url=f"https://t.me/{config['ad_manager_id']}")
+                )
+                await message.chat.send_message(
+                    f"@{user.username} הפרסום נמחק. להסדרת פרסום פנה למנהל.",
+                    reply_markup=button
+                )
 
-    if config["filters"].get("links"):
-        if any(e.type in ["url", "text_link"] for e in entities):
-            should_delete = True
-    if config["filters"].get("usernames") and "@" in text:
-        should_delete = True
-    if config["filters"].get("forwards") and message.forward_from:
-        should_delete = True
-
-    if not should_delete:
-        return
-
-    username = user.username or str(user.id)
-    if username in config["approved_users"]:
-        return
-
-    try:
-        await message.delete()
-    except:
-        return
-
-    manager = config.get("manager")
-    if manager:
-        button = InlineKeyboardMarkup.from_button(InlineKeyboardButton("לפנייה למנהל", url=f"https://t.me/{manager}"))
-        await message.chat.send_message("🔒 כדי לפרסם בקבוצה יש להסדיר זאת עם מנהל הקבוצה.", reply_markup=button)
-
-# ========== Main ==========
+# ---------------------- Main ----------------------
 async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    application = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("setmanager", set_manager))
-    app.add_handler(CommandHandler("approve", approve_user))
-    app.add_handler(CommandHandler("approved", list_approved))
-    app.add_handler(CommandHandler("settings", settings))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.ALL, handle_message))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("set_ad_manager", set_ad_manager))
+    application.add_handler(CommandHandler("approve", approve))
+    application.add_handler(CommandHandler("approved", approved_list))
+    application.add_handler(CommandHandler("settings", settings))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("🤖 הבוט פעיל")
-    await app.run_polling()
+    await application.initialize()
+    await application.start()
+    await asyncio.Event().wait()
 
 if __name__ == '__main__':
-    import asyncio
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    import time
+    asyncio.run(main())
